@@ -101,7 +101,11 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 /// Every key, grouped by section, sections in the shipped file's order.
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
-    entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    entry(
+        "bus.port",
+        Kind::Text,
+        "Serial port the servos and the IMU board share",
+    ),
     // Not a feature switch, though it is a `Bool`: the front page is "what does this robot
     // do", and this is "what does this robot's firmware understand". It belongs beside the
     // serial port, with the other thing you set once per board and then forget.
@@ -109,6 +113,30 @@ pub const REGISTRY: &[Entry] = &[
         "bus.fast_sync_read",
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
+    ),
+    // Not a feature switch, though `protocol` is arguably the most consequential key in this
+    // file: it is set once when a robot is built or rebuilt, and the answer never changes
+    // afterwards. The front page is for things somebody flips; this is for things somebody
+    // sets.
+    entry(
+        "bus.protocol",
+        Kind::Choice(crate::BUS_PROTOCOL_LABELS),
+        "Which servo family is fitted — dynamixel2 (XL330) or feetech-sts (HD-1910)",
+    ),
+    entry(
+        "bus.directions",
+        Kind::IntegerList,
+        "Per-joint servo direction, +1 or -1 in joint order — feetech only, and wrong means mirrored",
+    ),
+    entry(
+        "bus.p_gain_scale",
+        Kind::Float,
+        "Feetech only: the P coefficient for policy.gain = 1 — calibrate it on a bench",
+    ),
+    entry(
+        "bus.speed_unit",
+        Kind::Choice(crate::SPEED_UNIT_LABELS),
+        "Feetech only: present-speed unit — auto believes the servo's own phase bit",
     ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),

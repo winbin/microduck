@@ -40,7 +40,7 @@ own the mechanism is the bug.
 | | |
 |---|---|
 | [`architecture.md`](design/architecture.md) | The service split, the IPC contract, state ownership, safety and authority. |
-| [`robotd-design.md`](design/robotd-design.md) | The control loop: the Dynamixel bus and who owns the port, the model, sensing, observations, policy, safety — and what else hangs off the tick. |
+| [`robotd-design.md`](design/robotd-design.md) | The control loop: the servo bus — Dynamixel XL330 or Feetech HD-1910 — and who owns the port, the model, sensing, observations, policy, safety — and what else hangs off the tick. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
 | [`policy-channel-design.md`](design/policy-channel-design.md) | Where the ONNX policies come from: the `policies` component, trying someone else's, and what `reset` puts back. |
 | [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |

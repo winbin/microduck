@@ -8,6 +8,10 @@
 //! designed in `docs/design/robotd-design.md` §2.
 
 pub mod bus;
+/// The same bus, speaking Feetech SCS/STS — the HD-1910 servos.
+pub mod bus_feetech;
+/// Which of the two a robot is actually fitted with.
+pub mod bus_select;
 pub mod fall;
 pub mod imu;
 pub mod io;

@@ -1170,9 +1170,10 @@ fn spawn_control_thread(
         })
 }
 
-/// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
+/// The real bus on the board, whichever servo family it speaks; a fake elsewhere, so
+/// `open_bus_waiting` has one signature.
 #[cfg(target_os = "linux")]
-type BusIo = duck_control::bus::DynamixelIo;
+type BusIo = duck_control::bus_select::AnyBus;
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
 
@@ -1214,19 +1215,51 @@ fn open_bus(bus: &params::Bus, attempt: u32) -> Option<BusIo> {
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let port = bus.port.as_str();
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
-        Ok(io) => io,
-        Err(e) => {
-            if loud {
-                tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
+    let mut io = match bus.protocol {
+        // Nothing on the wire tells the two families apart, and a bus wired for one while
+        // configured for the other does not answer wrongly — it does not answer at all, which
+        // is exactly what an unpowered robot looks like. So the choice is read, never probed.
+        params::BusProtocol::Dynamixel2 => {
+            match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
+                Ok(io) => duck_control::bus_select::AnyBus::Dynamixel(Box::new(io)),
+                Err(e) => {
+                    if loud {
+                        tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
+                    }
+                    return None;
+                }
             }
-            return None;
+        }
+        params::BusProtocol::FeetechSts => {
+            let directions = directions_of(bus)?;
+            match duck_control::bus_feetech::FeetechIo::open(
+                port,
+                directions,
+                bus.p_gain_scale,
+                speed_unit_of(bus.speed_unit),
+            ) {
+                Ok(io) => duck_control::bus_select::AnyBus::Feetech(Box::new(io)),
+                Err(e) => {
+                    if loud {
+                        tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
+                    }
+                    return None;
+                }
+            }
         }
     };
+    if loud {
+        // Said once per attempt, because it is the one thing about a board that is decided
+        // when it is built and then invisible: "the wrong servo family" and "the servos are
+        // off" produce the same silence, and this line is what tells them apart.
+        tracing::info!(protocol = io.protocol(), port, "bus open");
+    }
     // Under the same `loud` rule as everything else here — a board waiting on servo power
     // retries this forever. Worth saying at all because the whole tick budget hangs off it,
     // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
-    if !bus.fast_sync_read && loud {
+    // Dynamixel only: a Feetech bus has no such instruction, so on one the key is inert and
+    // saying otherwise would send somebody to edit a line that does nothing.
+    if matches!(io, duck_control::bus_select::AnyBus::Dynamixel(_)) && !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
     }
     if !adopt_missing_servo(&mut io, loud) {
@@ -1249,12 +1282,51 @@ fn open_bus(bus: &params::Bus, attempt: u32) -> Option<BusIo> {
     Some(io)
 }
 
+/// `bus.directions` as the per-joint signs the Feetech backend takes.
+///
+/// `Params::validate` has already refused a list of the wrong length, so the check here is a
+/// backstop for a `Params` built in code rather than parsed — the tests and the simulator do
+/// that — and it answers rather than panicking because a daemon that will not start is much
+/// harder to diagnose than one that says why.
+#[cfg(target_os = "linux")]
+fn directions_of(bus: &params::Bus) -> Option<[f64; NUM_JOINTS]> {
+    if bus.directions.len() != NUM_JOINTS {
+        tracing::error!(
+            got = bus.directions.len(),
+            want = NUM_JOINTS,
+            "bus.directions needs one entry per joint"
+        );
+        return None;
+    }
+    let mut out = [1.0; NUM_JOINTS];
+    for (slot, direction) in out.iter_mut().zip(&bus.directions) {
+        *slot = if *direction < 0 { -1.0 } else { 1.0 };
+    }
+    Some(out)
+}
+
+/// The configured speed unit, as the backend's own enum.
+///
+/// Two enums for one choice because neither crate can name the other's: `robotd-params` is
+/// what `robotctl configure` links for the schema, and `duck-control` is what the daemon links
+/// for the motors, and the two must not be joined by a dependency over a three-valued setting.
+#[cfg(target_os = "linux")]
+fn speed_unit_of(unit: params::ServoSpeedUnit) -> duck_control::bus_feetech::SpeedUnit {
+    match unit {
+        params::ServoSpeedUnit::Auto => duck_control::bus_feetech::SpeedUnit::Auto,
+        params::ServoSpeedUnit::Step => duck_control::bus_feetech::SpeedUnit::Step,
+        params::ServoSpeedUnit::Step50 => duck_control::bus_feetech::SpeedUnit::Step50,
+    }
+}
+
 /// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
 /// answers instead, flash the new one as the missing joint.
 ///
 /// A ping census of the fifteen expected IDs is all a complete bus pays for this. The
-/// factory-defaults probe — which reopens the port at 57 600 baud — only runs once a single
-/// servo is known to be missing, so an ordinary boot never scans for anything.
+/// factory-defaults probe — which reopens the port at 57 600 baud on a Dynamixel bus — only
+/// runs once a single servo is known to be missing, so an ordinary boot never scans for
+/// anything. A Feetech servo ships at the speed the bus already runs at, so its probe is a
+/// ping and nothing more.
 ///
 /// Returns whether the bus is worth checking further. `false` is "keep waiting": every servo
 /// unpowered, a servo missing with nothing fresh to replace it, or two missing at once, which
@@ -1293,10 +1365,15 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
         Ok(true) => true,
         Ok(false) => {
             if loud {
+                // ID 1 is the factory default on both families, but the *speed* is not: a
+                // fresh XL330 answers at 57 600 baud and a fresh HD-1910 at 1 Mbps. The
+                // message names the protocol rather than a rate, so it cannot send somebody
+                // to the wrong bench procedure.
                 tracing::error!(
                     id,
-                    "servo missing and nothing answers at factory defaults (id 1, 57600 baud); \
-                     is it plugged in? waiting"
+                    protocol = io.protocol(),
+                    "servo missing and nothing answers at factory defaults (id 1); is it \
+                     plugged in? waiting"
                 );
             }
             false

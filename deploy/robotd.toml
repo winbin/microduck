@@ -32,6 +32,69 @@ port = "/dev/ttyS2"
 # this line. Needs a robotd restart.
 # fast_sync_read = true
 
+# Which servo family the robot is fitted with: "dynamixel2" (XL330, protocol 2.0 — what a
+# robot ships with) or "feetech-sts" (Feetech SCS/STS, the HD-1910 — `FF FF ID LEN INSTR … CHK`
+# at 1 Mbps).
+#
+# **Set this by hand when you swap the servos, because nothing else can.** Neither family
+# identifies itself usefully: a bus wired for one and configured for the other does not answer
+# *wrongly*, it does not answer at all, which is indistinguishable from servos that are simply
+# switched off. So there is nothing to probe and nothing to guess from — the only way this can
+# be known is somebody saying it.
+#
+# The two backends drive the same fifteen joints with the same DEFAULT_POSITION and the same
+# policies, so the trained gaits carry over unchanged. What differs is the wire, the register
+# map, the scaling, and the sense the servos count in — the three keys below are that last part.
+#
+# `fast_sync_read` above is Dynamixel-only and ignored here: instruction 0x8A does not exist on
+# the Feetech bus. It is deliberately not used to *infer* this setting, so that a Feetech robot's
+# configuration does not depend on a key that does nothing for it.
+#
+# Getting it wrong is loud rather than subtle — every read times out, the loop reports the bus
+# drops, `update_gate` calls the robot unhealthy.
+# protocol = "dynamixel2"
+
+# Per joint, +1 or -1: the direction that joint's servo counts in, relative to the sense
+# DEFAULT_POSITION and every trained policy are written in. 15 values, in joint order
+# (left leg 20-24, right leg 30-34, head 10-14).
+#
+# **The one hardware fact neither backend can discover, and the reason it is a setting rather
+# than a constant.** It is applied to the position read back, the velocity read back, and the
+# goal written — all three, so that flipping it mirrors the whole robot without ever letting
+# commands and feedback disagree about which way "forward" is. That disagreement is the failure
+# mode worth naming: it fails nothing, reports nothing, and walks badly.
+#
+# The HD-1910 counts the opposite way from the XL330 joint for joint, which is why the default
+# is -1 throughout. On a Dynamixel robot this key does nothing — that is the family the joint
+# sense was defined on. A list rather than one number because a robot can be built with a single
+# joint turned around, and a per-joint sign is the only way to say so.
+# directions = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+
+# Feetech only: the position P coefficient that corresponds to `policy.gain = 1`.
+#
+# **A starting point, not a tuning.** `policy.gain` is the XL330's position P register; a
+# Feetech coefficient is a single byte in the vendor's own unit, and the two are different
+# quantities. The written value is `gain * p_gain_scale`, clamped to 1..254. Too high and the
+# joints oscillate, too low and the robot walks soft — settle it on a bench at a known gain,
+# with `robotctl monitor` showing the step response.
+#
+# The D coefficient is deliberately left at the vendor's factory value as part of the HD-1910's
+# gear-train tuning; only P is written.
+# p_gain_scale = 1.0
+
+# Feetech only: the unit the present-speed register is read in — "auto", "step" or "step50".
+#
+# The register means one of two things depending on a bit in the servo's own `phase` register,
+# and the two differ by a factor of fifty (0.0146 RPM against 0.732 RPM). `auto` reads that bit
+# and is right on a servo whose control table is as the vendor shipped it; the other two are
+# what a bench falls back to when it is not.
+#
+# This one is worth understanding before changing it, because the failure is quiet: get it wrong
+# and every joint velocity in the observation vector is fifty times too big or too small. The
+# policies were trained on a velocity scale, so neither extreme fails anything — it just walks
+# badly, which is much harder to trace back to a config line.
+# speed_unit = "auto"
+
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
 # /etc/robot/robotd.toml once and never overwrites it, so an uncommented value is frozen on

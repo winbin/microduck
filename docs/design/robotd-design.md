@@ -26,10 +26,10 @@ second port:
 ```text
                      robotd — control thread
                               │
-                              │  duck_control::bus::DynamixelIo
+                              │  duck_control::bus_select::AnyBus
                               │  serialport · TIOCEXCL
                               ▼
-         /dev/ttyS2 · 1 Mbps · Dynamixel protocol v2
+   /dev/ttyS2 · 1 Mbps · protocol v2 (XL330) or SCS/STS (HD-1910)
                               │
     ┌────────────┬────────────┴───────┬──────────────────┐
     │            │                    │                  │
@@ -38,10 +38,14 @@ second port:
   v2 board    5 servos             5 servos           5 servos
 ```
 
+Which of the two families is on the far side of that port is `bus.protocol` (§2.1); the ids, the
+joint assignment and the pose the robot starts in are the same either way.
+
 The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because that is what
-the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP
-quaternion out of the same register block the servos answer at. One board, one code path, no
-IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
+the hardware does: the board sits on the bus and serves an on-chip SFLP quaternion out of the
+same register block the servos answer at, in the same first twelve bytes whichever family is
+configured. One board, one code path, no IMU abstraction. It is listed first in the id vector
+so it answers before the servo burst.
 
 **One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
@@ -339,6 +343,77 @@ notices; there is no version negotiation here and no probe at startup, because a
 not answer looks exactly like one that is unpowered and a probe would have to tell those apart
 before it could say anything useful.
 
+**A second servo family, chosen rather than discovered.** `bus.protocol` is `dynamixel2` or
+`feetech-sts`, and the second is a Feetech SCS/STS bus — the HD-1910. The two drive the same
+fifteen joints with the same `DEFAULT_POSITION` and the same fifteen trained policies, and that
+is not a coincidence: the position map is identical on both (`rad = 2π·counts/4096 − π`, 4096
+counts per revolution, 2048 at centre), which is what makes a motor swap a config change rather
+than a retrain.
+
+The choice is a setting because **nothing on the wire can make it for us.** A bus wired for one
+family and configured for the other does not answer *wrongly* — it does not answer at all, which
+is exactly what servos that are switched off look like. There is nothing to probe, and a probe
+would have to distinguish "wrong family" from "no power" before it could say anything. It is also
+deliberately not inferred from `fast_sync_read`: that key is a Dynamixel-only instruction, and
+inferring the family from it would make a Feetech robot's configuration depend on a key that does
+nothing for it.
+
+That key is inert here, and so is most of the Dynamixel section above. What differs:
+
+- **The wire.** `FF FF ID LEN INSTR … CHK`, a one's-complement checksum, half duplex, 1 Mbps —
+  protocol 1 framing, and only that framing. `rustypot`'s protocol 2 instruction 0x8A has no
+  counterpart, so every device answers for itself and `sync_read` (0x82) is the only sync read
+  there is. The "every sync read is a fast one" section above is a statement about the XL330.
+- **The block, at 56 for fifteen bytes** rather than 124 for twelve. Position, speed, load,
+  voltage, temperature, torque feedback, status, `moving` and current are contiguous, so voltage
+  and thermals arrive inside the tick's own transaction. `slow_sensors` therefore costs no bus
+  time at all — it hands back the previous tick — and the once-a-second third transaction above
+  is a Dynamixel-only cost.
+- **The sense.** An HD-1910 counts up where an XL330 counts down, joint for joint. That is
+  hardware, not protocol, and it is `bus.directions`, one `+1`/`-1` per joint, applied to the
+  position read back, the velocity read back *and* the goal written. All three, or the robot's
+  commands and its feedback disagree about which way is forward — which fails nothing, reports
+  nothing, and walks badly.
+- **The gains.** A Feetech position coefficient is one byte in the EEPROM region, and its unit is
+  the vendor's own; the robot's `gain` (200/160/50) is the XL330's register. `bus.p_gain_scale`
+  converts, and an uncalibrated value is a starting point rather than a tuning. **D is left at
+  the factory's 32** — where the Dynamixel path pins D at zero because the XL330 ships at zero,
+  zeroing it here removes part of the vendor's tuning for the gear train and the joints oscillate
+  under load. The P write goes out with the EEPROM lock **in place**, which is the documented way
+  to get RAM semantics and avoids wearing flash on every state change.
+- **The speed unit, and a factor of fifty.** The present-speed register means 1 step/s or 50
+  steps/s depending on a bit in the servo's `phase` register. `bus.speed_unit` defaults to `auto`
+  — believe the servo — with the two fixed units as the fallback for a bench that finds the bit
+  lies. Getting it wrong multiplies every joint velocity in the observation by fifty, and the
+  policy tolerates that well enough to walk badly, so the resolved value is logged at `warn` on
+  every startup: it is the only place the number behind that is written down.
+- **Adoption is simpler and, in one place, harder.** A new HD-1910 answers as ID 1 at 1 Mbps —
+  the same ID as the XL330 but *already* the bus speed, so there is no port reopen and no rate
+  register to write, and the 57 600 probe above never happens. What it costs instead is the write
+  lock: the factory ships `lock = 1`, the id register lives in EEPROM, and a locked EEPROM write
+  is **accepted and not persisted**. So the ID is written unlocked and the lock put back, and the
+  reboot that follows is not tidiness — it is what proves the write survived a reset. A servo
+  that comes back silent is reported as exactly that.
+- **The mode is read and reported, never written.** Putting a servo in the wrong mode makes it
+  ignore position commands, and writing mode across fifteen servos at once is how a robot arrives
+  gaitless with no way back. A person looks at that warning; this code does not act on it.
+  Response level is the opposite case and is *refused rather than corrected* when it is 0: at
+  level 0 a servo acknowledges nothing but reads and pings, so the correcting write could neither
+  land nor be confirmed, and "sent, unknown whether applied" is a worse bus to leave behind than
+  one that says why nothing was sent.
+
+The IMU board is the one thing that does not move. It is re-flashed to answer on the Feetech bus
+at the same ID 200 and the same address 56, with the same first twelve bytes — so `SflpDecoder`
+and its staleness window are unchanged across families, and bytes 12–14 stay outside that window
+so a board refreshing its counter without refreshing its orientation still reads as frozen.
+
+The two backends sit behind `AnyBus`, a hand-written enum with one forwarding line per method.
+**Not a `Box<dyn RobotIo>`**, and the reason is structural rather than stylistic: `open_bus` and
+`run_init` call `check_registers`, `missing_servos`, `adopt_replacement`, `present_positions` and
+`interpolate_to`, and none of those are on `RobotIo` — they are the bus's own business, kept out
+of the seam the control loop is written against. `Safety` is generic over the backend as well, so
+a trait object would not reach it either. The compiler is then what keeps the two in step.
+
 **Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
 thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
 lives in `robotd` rather than `duck-control` because it is a property of the Linux board, not
@@ -392,9 +467,9 @@ per-tick call and why bring-up is a state machine rather than a flag the loop ke
 already in) and `interpolate_to` (a blocking linear ramp — deliberately blocking, since
 nothing else should be talking to the bus while it runs).
 
-Two implementations: `DynamixelIo` and `FakeIo` (scripted samples, optionally frozen or
-failing on demand). `FakeIo` is what the test suite runs against, and it is why `cargo test`
-needs no hardware, no network and no Docker.
+Three implementations: `DynamixelIo`, `FeetechIo` (the second servo family, §2.1) and `FakeIo`
+(scripted samples, optionally frozen or failing on demand). `FakeIo` is what the test suite runs
+against, and it is why `cargo test` needs no hardware, no network and no Docker.
 
 **Neither is `cfg`-gated off macOS.** The gate was meant to keep `serialport` out of a
 laptop's dependency tree, but `rustypot` and `serialport` both build cleanly there, so it

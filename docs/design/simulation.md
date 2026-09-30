@@ -87,11 +87,13 @@ fn slow_sensors(&mut self) -> Result<SlowSensors>;   // volts, per-joint tempera
 
 Above it, nothing changes: the 50 Hz loop, the ONNX policies, `Safety`, fall detection, odometry,
 kinematics, maploc, every IPC call, all of `robotctl` and `duckctl`. Below it there is one thing —
-`DynamixelIo` — and the IMU is not separate from it, because on this robot the IMU is a Dynamixel
-node read in the same `sync_read` as the fifteen servos.
+the bus, and a robot has exactly one servo family on it, `DynamixelIo` or `FeetechIo` (§2.1 of
+`robotd-design.md`) — and the IMU is not separate from either, because on this robot the IMU is a
+bus node read in the same `sync_read` as the fifteen servos. A simulator therefore replaces
+neither family: `RemoteIo` speaks to MuJoCo on the other side of the same trait.
 
 `FakeIo` was already a full implementation of this trait, which is why `cargo test` needs no
-hardware. `RemoteIo` is the third.
+hardware. `RemoteIo` is the one this document is about.
 
 **Where a sensor's daemon *is* its driver, replace neither.** `tofd --fake` already synthesises
 frames at the loop level, and `tof/src/sensor.rs` says in as many words that the off-board `Sensor`

@@ -1782,6 +1782,82 @@ impl Default for SafetyParams {
     }
 }
 
+/// Which servo family this robot is fitted with.
+///
+/// **Not discoverable from the wire, and that is the whole reason it is a setting.** A bus
+/// wired for one family and configured for the other does not answer wrongly — it does not
+/// answer at all, which is exactly what an unpowered robot looks like. So there is nothing to
+/// probe and nothing to guess from; someone has to say which motors are on the robot.
+///
+/// The two backends drive the same fifteen joints with the same `DEFAULT_POSITION` and the
+/// same policies. What differs is the wire, the register map, the scaling, and the sense the
+/// servos count in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BusProtocol {
+    /// Dynamixel XL330 on Protocol 2.0 — what every shipped policy was trained against, and
+    /// what a robot leaves the factory with.
+    #[default]
+    Dynamixel2,
+    /// Feetech SCS/STS — the HD-1910, on `FF FF ID LEN INSTR … CHK` at 1 Mbps.
+    FeetechSts,
+}
+
+/// Every family, in the order an editor cycles them.
+///
+/// [`tests::every_bus_protocol_label_round_trips`] pins these to the strings the file may
+/// contain, because a label the editor writes and the parser rejects is a config that saves
+/// and then will not load.
+pub const BUS_PROTOCOL_LABELS: &[&str] = &["dynamixel2", "feetech-sts"];
+
+impl BusProtocol {
+    pub const ALL: [BusProtocol; 2] = [BusProtocol::Dynamixel2, BusProtocol::FeetechSts];
+
+    /// The string this is written as in `robotd.toml`.
+    pub fn label(self) -> &'static str {
+        match self {
+            BusProtocol::Dynamixel2 => "dynamixel2",
+            BusProtocol::FeetechSts => "feetech-sts",
+        }
+    }
+}
+
+/// How to scale the Feetech present-speed register.
+///
+/// The register means one of two things depending on a bit in the servo's `phase` register,
+/// and the two differ by a factor of fifty. [`BusProtocol::FeetechSts`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServoSpeedUnit {
+    /// Believe the servo: the `phase` bit says which unit it reports in.
+    #[default]
+    Auto,
+    /// One count is one step per second — the datasheet's 0.0146 RPM.
+    Step,
+    /// One count is fifty steps per second — the 0.732 RPM.
+    Step50,
+}
+
+/// Every unit, in the order an editor cycles them.
+pub const SPEED_UNIT_LABELS: &[&str] = &["auto", "step", "step50"];
+
+impl ServoSpeedUnit {
+    pub const ALL: [ServoSpeedUnit; 3] = [
+        ServoSpeedUnit::Auto,
+        ServoSpeedUnit::Step,
+        ServoSpeedUnit::Step50,
+    ];
+
+    /// The string this is written as in `robotd.toml`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ServoSpeedUnit::Auto => "auto",
+            ServoSpeedUnit::Step => "step",
+            ServoSpeedUnit::Step50 => "step50",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Bus {
@@ -1805,6 +1881,42 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// Which servo family is fitted. See [`BusProtocol`].
+    ///
+    /// Ignored by the Dynamixel backend, which has no counterpart — and deliberately not
+    /// inferred from anything else in this file: `fast_sync_read` is a Dynamixel-only
+    /// instruction, so reading the protocol off it would make a Feetech robot's configuration
+    /// depend on a key that does nothing for it.
+    pub protocol: BusProtocol,
+    /// Per joint, `+1` or `-1`: the direction that joint's servo counts in, relative to the
+    /// sense `DEFAULT_POSITION` and every trained policy are written in.
+    ///
+    /// **The one hardware fact neither backend can discover.** Applied to the position read
+    /// back, the velocity read back, and the goal written — so flipping it is a mirror of the
+    /// whole robot, and the thing it exists for is a servo family that counts the other way
+    /// from the one the policies were trained on. The HD-1910 does, joint for joint, which is
+    /// why the default is `-1` throughout rather than `+1`.
+    ///
+    /// A list rather than one number because a robot could be built with one joint turned
+    /// around, and a per-joint sign is the only way to say that. Ignored by the Dynamixel
+    /// backend, which is the family the joint sense was defined on.
+    pub directions: Vec<i8>,
+    /// The Feetech position P coefficient that corresponds to `policy.gain = 1`.
+    ///
+    /// Not `1.0`, and not interchangeable with it. `policy.gain` — 200 running, 160 standing,
+    /// 50 limp — is the XL330's position P, and a Feetech coefficient is a single byte whose
+    /// unit is the vendor's own; the two are different quantities, so `gain × p_gain_scale`
+    /// is clamped to 1..254 and written. **A value that has not been calibrated against a
+    /// bench step response is a starting point, not a tuning**: too high oscillates, too low
+    /// walks soft. `robotctl monitor` at a known `gain` is where it gets settled.
+    pub p_gain_scale: f64,
+    /// The unit the Feetech present-speed register is read in. See [`ServoSpeedUnit`].
+    ///
+    /// `auto` reads the servo's own `phase` bit and is right on a servo whose control table
+    /// is as the vendor set it. The other two are what a bench measures when it is not —
+    /// and they exist because getting this wrong multiplies every joint velocity in the
+    /// observation vector by fifty, which fails nothing and walks badly.
+    pub speed_unit: ServoSpeedUnit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1875,6 +1987,14 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            protocol: BusProtocol::default(),
+            // All fifteen. The HD-1910 counts the other way from the XL330 joint for joint,
+            // and a robot changes servo family all at once rather than one joint at a time,
+            // so this is the useful default rather than a neutral one. It does nothing on a
+            // Dynamixel bus, where the joint sense is the one the policies were trained in.
+            directions: vec![-1; duck_ipc_proto::JOINT_NAMES.len()],
+            p_gain_scale: 1.0,
+            speed_unit: ServoSpeedUnit::default(),
         }
     }
 }
@@ -1931,6 +2051,20 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error(
+        "{path}: bus.directions has {got} entries and needs {expected} — one per joint, in \
+         JOINT_NAMES order"
+    )]
+    DirectionsLength {
+        path: String,
+        got: usize,
+        expected: usize,
+    },
+    #[error(
+        "{path}: bus.directions[{index}] is {got}, and the only values that mean anything are \
+         +1 and -1"
+    )]
+    DirectionValue { path: String, index: usize, got: i8 },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2017,6 +2151,35 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // `directions` is indexed by joint, so a list of the wrong length silently pairs every
+        // joint after the gap with its neighbour's sign — a robot standing mirrored on one leg
+        // and nowhere near the fault. Checked here rather than at the bus, so the editor
+        // refuses to write it rather than the daemon refusing to boot on it.
+        //
+        // Checked for both protocols, deliberately: the list does nothing on a Dynamixel bus,
+        // and a robot being switched from Feetech to Dynamixel must not be blocked by a stale
+        // list it is no longer using. Only a list that cannot be right either way is refused.
+        let expected = duck_ipc_proto::JOINT_NAMES.len();
+        if self.bus.directions.len() != expected {
+            return Err(ParamsError::DirectionsLength {
+                path: path.display().to_string(),
+                got: self.bus.directions.len(),
+                expected,
+            });
+        }
+        if let Some((index, got)) = self
+            .bus
+            .directions
+            .iter()
+            .enumerate()
+            .find(|(_, d)| **d != 1 && **d != -1)
+        {
+            return Err(ParamsError::DirectionValue {
+                path: path.display().to_string(),
+                index,
+                got: *got,
             });
         }
         Ok(())
@@ -3364,5 +3527,116 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// The two families `bus.protocol` may name. A label the editor offers and the parser
+    /// rejects is a config that saves and then will not load — and the default has to stay
+    /// `dynamixel2`, because that is the family every shipped robot is fitted with and naming
+    /// the setting must not change what an unprovisioned board does.
+    #[test]
+    fn every_bus_protocol_label_round_trips() {
+        assert_eq!(BUS_PROTOCOL_LABELS.len(), BusProtocol::ALL.len());
+        for (label, protocol) in BUS_PROTOCOL_LABELS.iter().zip(BusProtocol::ALL) {
+            assert_eq!(*label, protocol.label());
+            let parsed: Params =
+                toml::from_str(&format!("[bus]\nprotocol = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.bus.protocol, protocol);
+        }
+        assert_eq!(Bus::default().protocol, BusProtocol::Dynamixel2);
+    }
+
+    /// Same contract for the speed unit, and here the default matters for a second reason:
+    /// `auto` is the only one that asks the servo what it means rather than assuming, so a
+    /// robot with no key set must land there and not on a bench's measured override.
+    #[test]
+    fn every_speed_unit_label_round_trips() {
+        assert_eq!(SPEED_UNIT_LABELS.len(), ServoSpeedUnit::ALL.len());
+        for (label, unit) in SPEED_UNIT_LABELS.iter().zip(ServoSpeedUnit::ALL) {
+            assert_eq!(*label, unit.label());
+            let parsed: Params =
+                toml::from_str(&format!("[bus]\nspeed_unit = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.bus.speed_unit, unit);
+        }
+        assert_eq!(Bus::default().speed_unit, ServoSpeedUnit::Auto);
+    }
+
+    /// A `bus.directions` list, as TOML: one entry per joint, all the same value.
+    fn directions_of(value: i8) -> String {
+        let count = duck_ipc_proto::JOINT_NAMES.len();
+        format!("[{}]", vec![value.to_string(); count].join(", "))
+    }
+
+    /// The default sense is all `-1`, and that is a measured hardware fact rather than a
+    /// stylistic choice: an HD-1910 counts the opposite way from an XL330 joint for joint, so
+    /// a robot that swapped servos and left this alone gets the robot it already had. Fifteen
+    /// entries because it is indexed by joint.
+    #[test]
+    fn the_default_directions_are_the_hd1910s_sense() {
+        let directions = Bus::default().directions;
+        assert_eq!(directions.len(), duck_ipc_proto::JOINT_NAMES.len());
+        assert!(
+            directions.iter().all(|d| *d == -1),
+            "a joint left at +1 would mirror that one joint: {directions:?}"
+        );
+        // And the shipped file agrees, since it is the file an operator reads to learn this.
+        let shipped: Params =
+            toml::from_str(include_str!("../../deploy/robotd.toml")).expect("parses");
+        assert_eq!(shipped.bus.directions, directions);
+    }
+
+    /// `directions` is indexed by joint, so a list that is not fifteen long silently pairs
+    /// every joint with its neighbour's sign — a robot that walks mirrored, reports healthy,
+    /// and gives nothing to trace it back to. Refused rather than padded or truncated.
+    #[test]
+    fn a_directions_list_of_the_wrong_length_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = format!(
+            "[{}]",
+            vec!["-1"; duck_ipc_proto::JOINT_NAMES.len() - 1].join(", ")
+        );
+        for list in ["[]", "[1]", short.as_str()] {
+            let path = write(dir.path(), &format!("[bus]\ndirections = {list}\n"));
+            let err = Params::load(&path, true)
+                .expect_err("a directions list of the wrong length was accepted")
+                .to_string();
+            assert!(err.contains("bus.directions"), "{err}");
+        }
+        // Fifteen is accepted, so what is being checked is the length and not something that
+        // refuses every list.
+        let path = write(
+            dir.path(),
+            &format!("[bus]\ndirections = {}\n", directions_of(1)),
+        );
+        assert!(Params::load(&path, true).is_ok());
+    }
+
+    /// A direction is a sign, and only a sign. `2` is not a rotation of two — it scales the
+    /// joint's feedback and its commands by two, which produces a robot that moves at a
+    /// plausible-looking fraction of the speed it was asked for and fails nothing.
+    #[test]
+    fn a_direction_that_is_not_a_sign_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = duck_ipc_proto::JOINT_NAMES.len();
+
+        let mut wrong = vec!["-1"; count];
+        wrong[3] = "2";
+        let path = write(
+            dir.path(),
+            &format!("[bus]\ndirections = [{}]\n", wrong.join(", ")),
+        );
+        let err = Params::load(&path, true)
+            .expect_err("a direction of 2 was accepted")
+            .to_string();
+        assert!(err.contains("bus.directions[3]"), "{err}");
+
+        // Zero is refused for the same reason and reads even more innocently: a joint pinned
+        // at its centre, reporting a constant, on a robot whose other fourteen work.
+        let mut zero = vec!["-1"; count];
+        zero[7] = "0";
+        let path = write(
+            dir.path(),
+            &format!("[bus]\ndirections = [{}]\n", zero.join(", ")),
+        );
+        assert!(Params::load(&path, true).is_err());
     }
 }
