@@ -37,7 +37,14 @@ jobs:
     # Not in a fork. A contributor's push runs this in their fork, where the dev key does not
     # exist, so every run ended red at the signing step — a failure that says nothing about the
     # change and hides one that does. `ci.yml` on the pull request is what checks their work.
-    if: ${{ !github.event.repository.fork }}
+    #
+    # `winbin/microduck` is carved out of that rule because it is not a contributor's fork: it is
+    # the source of the bench robot this branch was written for. That fork holds
+    # `MINISIGN_DEV_SECRET_KEY`, and the board already has the matching `winbin.dev.pub` in
+    # `/etc/robot/trusted_keys` with `allow_dev_keys = true` — so the reason the blanket refusal
+    # exists (no key to sign with) does not apply, and a push here *is* the intended way to get a
+    # build onto that robot. Any other fork still skips.
+    if: ${{ !github.event.repository.fork || github.repository == 'winbin/microduck' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
